@@ -1,0 +1,192 @@
+#![cfg_attr(
+    all(not(debug_assert/// Replacement for the previous `call_openai` — now speaks to your local Qwen server
+/// running llama.cpp's OpenAI-compatible `/v1/chat/completions` on port 5050.
+#[tauri::command]
+async fn call_openai(window: Window, state: State<'_, AppState>, input: ChatInput) -> Result<(), String> {), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
+use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tauri::{Emitter, State, Window};
+use tracing::{debug, error, info};
+
+#[derive(Default)]
+struct AppState {
+    /// Base URL for the OpenAI-compatible server (llama.cpp server)
+    base_url: String,
+    /// API key required by llama-server (can be empty if you didn't launch with --api-key)
+    api_key: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct Message {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatInput {
+    /// User message; we’ll wrap it into OpenAI-style messages
+    message: String,
+    /// Optional system prompt to prepend
+    system: Option<String>,
+    /// Optional model name (for multi-model setups)
+    model: Option<String>,
+    /// Temperature override
+    temperature: Option<f32>,
+}
+
+/// Replacement for the previous `call_openai` — now speaks to your local Qwen server
+/// running llama.cpp’s OpenAI-compatible `/v1/chat/completions` on port 5050.
+##[tauri::command]
+async fn call_openai(window: Window, state: State<'_, AppState>, input: ChatInput) -> Result<(), String> {
+    let client = reqwest::Client::new();
+
+    // Build messages array: optional system + user
+    let mut messages: Vec<Message> = Vec::new();
+    if let Some(sys) = &input.system {
+        if !sys.trim().is_empty() {
+            messages.push(Message { role: "system".into(), content: sys.clone() });
+        }
+    }
+    messages.push(Message { role: "user".into(), content: input.message.clone() });
+
+    // Compose request
+    let url = format!("{}/chat/completions", state.base_url);
+    let temperature = input.temperature.unwrap_or(0.7);
+    let model = input.model.clone().unwrap_or_else(|| "qwen2.5-3b-gguf".to_string());
+
+    let body = json!({
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "stream": true
+    });
+
+    info!(target = "qwen", %url, temperature, model, "Sending chat request");
+    debug!(target = "qwen", "Request body: {}", body);
+
+    let mut req = client.post(url)
+        .header("Content-Type", "application/json")
+        .json(&body);
+
+    // Bearer token only if provided (matches llama-server --api-key)
+    if !state.api_key.is_empty() {
+        req = req.bearer_auth(&state.api_key);
+        debug!(target = "qwen", api_key_set = true, "Authorization header attached");
+    } else {
+        debug!(target = "qwen", api_key_set = false, "No Authorization header (server started without --api-key?)");
+    }
+
+    let resp = req.send().await.map_err(|e| {
+        error!(target = "qwen", error = %e, "Request error");
+        e.to_string()
+    })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        error!(target = "qwen", %status, body = %text, "Server returned non-success");
+        return Err(format!("server responded {status}: {text}"));
+    }
+
+    info!(target = "qwen", "Streaming response started");
+
+    // SSE stream from llama.cpp: lines prefixed with "data: {json}
+
+".
+    let mut stream = resp.bytes_stream();
+    let mut buffer = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => {
+                error!(target = "qwen", error = %e, "Stream error");
+                return Err(format!("stream error: {e}"));
+            }
+        };
+        let piece = String::from_utf8_lossy(&bytes);
+        buffer.push_str(&piece);
+
+        // Process complete lines; keep a tail if partial
+        let mut last_newline_idx = 0usize;
+        for line in buffer.split('
+') {
+            last_newline_idx += line.len() + 1; // +1 for the split newline char
+
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with("data:") { continue; }
+            let payload = trimmed.trim_start_matches("data:").trim();
+            if payload == "[DONE]" { info!(target = "qwen", "Stream finished"); break; }
+            if payload.is_empty() { continue; }
+
+            // Try to parse the JSON line from the stream
+            match serde_json::from_str::<serde_json::Value>(payload) {
+                Ok(v) => {
+                    let delta = v["choices"][0]["delta"]["content"].as_str().unwrap_or("");
+                    if !delta.is_empty() {
+                        debug!(target = "qwen", chunk_len = delta.len(), "Emitting delta chunk");
+                        let _ = window.emit("chat:delta", delta);
+                    }
+                }
+                Err(e) => {
+                    debug!(target = "qwen", error = %e, "Failed to parse stream JSON; trying fallback");
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+                        if let Some(s) = v.get("content").and_then(|c| c.as_str()) {
+                            debug!(target = "qwen", chunk_len = s.len(), "Emitting fallback delta chunk");
+                            let _ = window.emit("chat:delta", s);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Retain only the incomplete tail (if any)
+        if last_newline_idx < buffer.len() {
+            let tail = buffer[last_newline_idx..].to_string();
+            buffer.clear();
+            buffer.push_str(&tail);
+        } else {
+            buffer.clear();
+        }
+    }
+
+    Ok(())
+}
+
+/// Keep your existing helper (unchanged). Example placeholder that runs a local command
+#[tauri::command]
+fn run_command(cmd: String, args: Vec<String>) -> Result<String, String> {
+    use std::process::Command;
+    let out = Command::new(cmd)
+        .args(args)
+        .output()
+        .map_err(|e| format!("Command failed: {e}"))?;
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn main() {
+    // Load environment variables from .env file
+    dotenv::dotenv().ok();
+    
+    // Initialize structured logging (RUST_LOG controls level, e.g., RUST_LOG=debug)
+    let _ = tracing_subscriber::fmt()
+        .with_target(false)
+        .compact()
+        .try_init();
+
+    // Read envs; fall back to local llama.cpp defaults
+    let base_url = std::env::var("AI_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:5050/v1".into());
+    let api_key  = std::env::var("AI_API_KEY").unwrap_or_default();
+
+    info!(base_url=%base_url, api_key_set=!api_key.is_empty(), "Starting Tauri backend with OpenAI-compatible Qwen server");
+
+    tauri::Builder::default()
+        .manage(AppState { base_url, api_key })
+        .invoke_handler(tauri::generate_handler![call_openai, run_command])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri app");
+}
